@@ -1342,6 +1342,21 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+        # Client-side request rate limiter (model.rate_limit_rpm in config.yaml)
+        _model_cfg = _agent_cfg.get("model", {}) if isinstance(_agent_cfg, dict) else {}
+        _rate_limit_rpm = 0
+        try:
+            _raw = _model_cfg.get("rate_limit_rpm") if isinstance(_model_cfg, dict) else None
+            if _raw is not None:
+                _rate_limit_rpm = float(_raw)
+        except (TypeError, ValueError):
+            pass
+        if _rate_limit_rpm > 0:
+            from agent.rate_limit_tracker import TokenBucketRateLimiter
+            self._api_rate_limiter = TokenBucketRateLimiter(rate_per_second=_rate_limit_rpm / 60.0)
+        else:
+            self._api_rate_limiter = None
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -5050,6 +5065,8 @@ class AIAgent:
                     raw_response = client.converse(**api_kwargs)
                     result["response"] = normalize_converse_response(raw_response)
                 else:
+                    if self._api_rate_limiter is not None:
+                        self._api_rate_limiter.acquire()
                     request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
             except Exception as e:
@@ -5397,6 +5414,8 @@ class AIAgent:
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
             self._touch_activity("waiting for provider response (streaming)")
+            if self._api_rate_limiter is not None:
+                self._api_rate_limiter.acquire()
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
             # Capture rate limit headers from the initial HTTP response.

@@ -244,3 +244,50 @@ def format_rate_limit_compact(state: RateLimitState) -> str:
         parts.append(f"TPH: {_fmt_count(th.remaining)}/{_fmt_count(th.limit)} (resets {_fmt_seconds(th.remaining_seconds_now)})")
 
     return " | ".join(parts)
+
+
+# ── Client-side rate limiting ────────────────────────────────────────────────
+
+
+class TokenBucketRateLimiter:
+    """Thread-safe token bucket for client-side request rate limiting.
+
+    Uses threading.Condition with a precise timeout instead of spin-wait,
+    so the thread sleeps until tokens are available (or the timeout fires)
+    without polling the CPU or blocking the gateway event loop.
+    """
+
+    def __init__(self, rate_per_second: float):
+        self._rate = max(0.0, rate_per_second)
+        # Bucket capacity: at least 1 request can always proceed immediately.
+        # For rate < 1 req/s, we need a larger bucket so refill over time can
+        # accumulate enough tokens before the next request arrives.
+        self._capacity = max(1.0, self._rate)
+        self._tokens = self._capacity  # start full
+        self._last_refill = time.monotonic()
+        self._lock = __import__("threading").Lock()
+        self._cond = __import__("threading").Condition(self._lock)
+
+    def acquire(self, tokens: float = 1.0) -> None:
+        """Block until a token is available (or disabled)."""
+        if self._rate <= 0:
+            return  # unlimited
+        with self._cond:
+            while True:
+                self._refill()
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                # Tokens needed to satisfy this request; divide by refill rate
+                # for precise wait.  tokens_needed > 0 always here.
+                tokens_needed = tokens - self._tokens
+                wait_seconds = tokens_needed / self._rate
+                self._cond.wait(timeout=wait_seconds)
+
+    def _refill(self) -> None:
+        """Top up tokens based on elapsed wall-clock time, capped at bucket capacity."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        # Add tokens based on elapsed time, capped at capacity (not rate)
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        self._last_refill = now
